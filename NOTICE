@@ -1,0 +1,25 @@
+shelf
+Copyright (C) 2026 Aaqif Zaman
+Licensed under the GNU General Public License, version 3. See LICENSE.
+
+shelf adapts mechanisms from two GPLv3 menu bar managers. It copies no
+files from them. The adapted parts are the private WindowServer calls,
+the window-capture call for icon pictures, the event fields and geometry
+of a synthetic menu bar drag, and the second "source-anchored" drag.
+
+Ice
+  https://github.com/jordanbaird/Ice
+  Copyright (C) 2023-2025 Jordan Baird
+  Licensed under the GNU General Public License, version 3.
+
+Thaw (based on Ice)
+  https://github.com/thaw-app/Thaw
+  Copyright (C) 2023-2025 Jordan Baird (Ice)
+  Copyright (C) 2026 Toni Förster (Thaw)
+  Licensed under the GNU General Public License, version 3.
+
+Files in shelf that adapt these mechanisms:
+  Sources/shelf/WindowServer.swift   private WindowServer calls and icon capture
+  Sources/shelf/Mover.swift          the synthetic Command-drag that moves an icon
+
+Comments in these files name the upstream project for each mechanism.
