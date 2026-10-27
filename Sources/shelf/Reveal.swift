@@ -12,7 +12,7 @@ final class Reveal {
     private var leaveTimer: Timer?
     private var openedByHover = false
     private var scrollSum: CGFloat = 0
-    private var appMenuCache: (pid: pid_t, frame: CGRect, at: Date)?
+    private var appMenuCache: (pid: pid_t, screen: NSRect, frame: CGRect, at: Date)?
 
     init(model: Model, bar: ShelfBar) {
         self.model = model
@@ -100,10 +100,10 @@ final class Reveal {
 
     // MARK: Geometry (Cocoa coordinates in, CoreGraphics top-left frames compared)
 
-    private var screen: NSScreen? { NSScreen.screens.first }
+    private var screen: NSScreen? { ScreenGeometry.screen(for: model.icon(IDs.icon)) }
 
     private func isInMenuBar(_ p: NSPoint) -> Bool {
-        guard let s = screen else { return false }
+        guard model.pauseReason == nil, let s = screen else { return false }
         let height = max(s.frame.maxY - s.visibleFrame.maxY, 24)
         return s.frame.contains(p) && p.y >= s.frame.maxY - height
     }
@@ -113,19 +113,23 @@ final class Reveal {
         guard isInMenuBar(p), let s = screen else { return false }
         let x = p.x
         if let left = s.auxiliaryTopLeftArea, let right = s.auxiliaryTopRightArea, x > left.maxX, x < right.minX { return false }
-        if x <= appMenuMaxX() { return false }
-        for icon in model.icons where icon.id != IDs.divider && icon.maxX > 0 {
+        if x <= appMenuMaxX(s) { return false }
+        for icon in model.icons where icon.id != IDs.divider {
             if x >= icon.x && x <= icon.maxX { return false }
         }
         return true
     }
 
-    /// Right edge of the frontmost app's menus (File, Edit, ...). Cached briefly.
-    private func appMenuMaxX() -> CGFloat {
-        guard let app = NSWorkspace.shared.frontmostApplication else { return 0 }
+    /// Right edge of the menus (Apple, File, Edit, ...) of the app that owns the menu bar. Cached briefly.
+    /// The owner, not the frontmost app: an accessory app in front (Raycast, shelf's settings) has no menus.
+    /// A failed lookup must never read as "no menus", or a click on the Apple menu opens the shelf bar.
+    private func appMenuMaxX(_ s: NSScreen) -> CGFloat {
+        let unknown = s.auxiliaryTopLeftArea?.maxX ?? s.frame.midX
+        guard let app = NSWorkspace.shared.menuBarOwningApplication else { return unknown }
         let pid = app.processIdentifier
-        if let c = appMenuCache, c.pid == pid, Date().timeIntervalSince(c.at) < 2 { return c.frame.maxX }
-        var maxX: CGFloat = 0
+        if let c = appMenuCache, c.pid == pid, c.screen == s.frame, Date().timeIntervalSince(c.at) < 2 { return c.frame.maxX }
+        var maxX: CGFloat?
+        guard let quartzTop = ScreenGeometry.quartzPoint(NSPoint(x: s.frame.minX, y: s.frame.maxY)) else { return unknown }
         let el = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(el, 0.1)
         var bar: CFTypeRef?
@@ -136,12 +140,13 @@ final class Reveal {
                 var v: CFTypeRef?
                 var r = CGRect.zero
                 if AXUIElementCopyAttributeValue(kid, "AXFrame" as CFString, &v) == .success, let v, AXValueGetValue(v as! AXValue, .cgRect, &r) {
-                    maxX = max(maxX, r.maxX)
+                    if abs(r.minY - quartzTop.y) <= 3 { maxX = max(maxX ?? r.maxX, r.maxX) }
                 }
             }
         }
-        appMenuCache = (pid, CGRect(x: 0, y: 0, width: maxX, height: 24), Date())
-        return maxX
+        guard let edge = maxX else { return unknown }
+        appMenuCache = (pid, s.frame, CGRect(x: edge, y: 0, width: 0, height: 24), Date())
+        return edge
     }
 }
 

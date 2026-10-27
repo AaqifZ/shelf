@@ -140,6 +140,45 @@ do {
     expect(IDs.ownerFits(windowName: "Item-0", owner: "com.knollsoft.Rectangle", apps: apps), "plain item name fits")
     expect(IDs.ownerFits(windowName: "vault.15m.sh", owner: "com.ameba.SwiftBar", apps: apps), "dotted plugin name fits")
     expect(IDs.ownerFits(windowName: nil, owner: "com.knollsoft.Rectangle", apps: apps), "no name fits")
+    expect(IDs.isKnownControlCenterWindow("Clock"), "Clock has a known Control Center owner")
+    expect(IDs.isKnownControlCenterWindow("BentoBox-0"), "BentoBox has a known Control Center owner")
+    expect(!IDs.isKnownControlCenterWindow("Battery"), "Battery still requires AX ownership")
+    expect(!IDs.isKnownControlCenterWindow("WiFi"), "WiFi still requires AX ownership")
+    expect(!IDs.isKnownControlCenterWindow("Item-0"), "generic Item-0 still requires AX ownership")
+    expect(IDs.canUseControlCenterFallback("Clock", among: ["Item-0", "Clock"]), "one Clock can use the fixed-item fallback")
+    expect(!IDs.canUseControlCenterFallback("Clock", among: ["Clock", "Item-0", "Clock"]), "duplicate Clock names reject fallback")
+    expect(!IDs.canUseControlCenterFallback("WiFi", among: ["WiFi"]), "movable system items reject fallback")
+}
+
+print("two displays (25 Oct: Dell left of the main display, both menu bars at y 0)")
+do {
+    // One strip, left to right from `start`, as macOS lays it out: edge to edge.
+    func strip(_ start: Double, _ items: [(UInt32, Double)]) -> [Strip.Window] {
+        var x = start
+        return items.map { id, w in defer { x += w }; return Strip.Window(id: id, minX: x, maxX: x + w) }
+    }
+    // Main display 0...1470. Real: 2 hidden, the 10,000 pt divider (1), the shelf icon (2), 3 visible, Clock at the right edge.
+    let realItems: [(UInt32, Double)] = [(65, 98), (66, 38), (1, 10_000), (2, 28), (67, 73), (13, 38), (12, 138)]
+    let width = realItems.reduce(0) { $0 + $1.1 }
+    let onMain = strip(1470 - width, realItems)
+    // The Dell's copies of the same items, ending at its right edge (x 0), with new window ids.
+    let copies = strip(0 - width, realItems.map { ($0.0 + 13_000, $0.1) })
+    let all = onMain + copies
+    let real = Strip.real(all, anchor: 2, mainMinX: 0, mainMaxX: 1470)
+    expect(real == Set(realItems.map(\.0)), "only the main display's real strip counts", "\(real.sorted())")
+    expect(Strip.real(all, anchor: 13_002, mainMinX: 0, mainMaxX: 1470).isEmpty, "a copy of the shelf icon is never the anchor")
+    // Hidden icons are pushed far off the screen, into the x range of the Dell's copies: still one strip.
+    expect(onMain[0].maxX < copies.last!.minX, "test layout: hidden icons sit among the copies' x range")
+
+    // The user works on the Dell: the real windows move there, the main display gets the copies.
+    let realOnDell = strip(0 - width, realItems), copiesOnMain = strip(1470 - width, realItems.map { ($0.0 + 13_000, $0.1) })
+    expect(Strip.real(realOnDell + copiesOnMain, anchor: 2, mainMinX: 0, mainMaxX: 1470).isEmpty,
+           "real icons on another display: nothing to manage, so no moves")
+
+    expect(Strip.real(all, anchor: nil, mainMinX: 0, mainMaxX: 1470).isEmpty, "no anchor: nothing")
+    var gapped = onMain
+    gapped[0].minX -= 50; gapped[0].maxX -= 50
+    expect(!Strip.real(gapped, anchor: 2, mainMinX: 0, mainMaxX: 1470).contains(65), "a window that does not touch the strip is not in it")
 }
 
 print(failures == 0 ? "all passed" : "\(failures) FAILED")

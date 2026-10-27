@@ -9,6 +9,7 @@ final class Model: ObservableObject {
     @Published private(set) var images: [String: NSImage] = [:]
     @Published var options = Options()
     @Published var lastCheck = "not run yet"
+    @Published private(set) var pauseReason: String?
     @Published var barOpen = false
     @Published var settingsOpen = false
     /// Menu bar icons are drawn white on a dark menu bar. Read from the shelf icon's own appearance.
@@ -37,10 +38,19 @@ final class Model: ObservableObject {
     func apply(_ snap: Engine.Snapshot) {
         if snap.icons != icons { icons = snap.icons }
         if snap.layout != layout { layout = snap.layout }
+        if snap.options != options { options = snap.options }
+        pauseReason = snap.pauseReason
         pinned = snap.pinned
         // A picture belongs to a window, not just an id. Drop pictures whose icon is gone or now lives in
         // another window (an app re-created its item). No stale pictures, ever (Codex follow-up F1).
-        let windows = Dictionary(icons.map { ($0.id, $0.windowID) }, uniquingKeysWith: { a, _ in a })
+        let geometry = Dictionary(icons.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let windows = geometry.mapValues(\.windowID)
+        if geometry != lastGeometry {
+            lastGeometry = geometry
+            generation += 1
+            if capturing { captureAgain = true }
+            images.removeAll(); imageWindows.removeAll()
+        }
         if windows != lastWindows {
             lastWindows = windows
             generation += 1  // a capture already running is now outdated
@@ -59,6 +69,7 @@ final class Model: ObservableObject {
     private var captureAgain = false
     private var generation = 0
     private var lastWindows: [String: UInt32] = [:]
+    private var lastGeometry: [String: Icon] = [:]
     /// The window each picture was taken from.
     private var imageWindows: [String: UInt32] = [:]
     var onImages: () -> Void = {}
@@ -123,7 +134,7 @@ final class Model: ObservableObject {
     private let writer = DispatchQueue(label: "shelf.state", qos: .utility)
     private func writeState() {
         let now = Date()
-        var state = State(updated: now, icons: icons.map(\.id), bar: barRendered, settings: settingsRendered, pinned: pinned.sorted())
+        var state = State(updated: now, icons: icons.map(\.id), bar: barRendered, settings: settingsRendered, pinned: pinned.sorted(), pauseReason: pauseReason)
         if let last = lastWritten {
             var same = last; same.updated = now
             if same == state && now.timeIntervalSince(last.updated) < 10 { return }
@@ -142,5 +153,5 @@ final class Model: ObservableObject {
         engine.place(id, in: section, before: before)
     }
 
-    func setOptions(_ o: Options) { options = o; engine.setOptions(o) }
+    func setOption(_ key: WritableKeyPath<Options, Bool>, to value: Bool) { engine.setOption(key, to: value) }
 }

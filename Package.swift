@@ -12,6 +12,9 @@ let package = Package(
         .executableTarget(name: "shelf", dependencies: ["ShelfCore"]),
         // Tests without XCTest (CLT-only machine): `swift run ShelfSelfTest`.
         .executableTarget(name: "ShelfSelfTest", dependencies: ["ShelfCore"]),
+        .executableTarget(name: "ShelfDisplayTest", dependencies: ["ShelfCore"]),
+        .executableTarget(name: "ShelfRecoveryTest", dependencies: ["ShelfCore"]),
+        .executableTarget(name: "ShelfPersistenceTest", dependencies: ["ShelfCore"]),
         // A fake app whose menu bar icon comes and goes, like a timer app. Used by Test 1.
         .executableTarget(name: "ShelfChurn"),
     ]

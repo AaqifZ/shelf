@@ -17,7 +17,8 @@ public enum Planner {
     /// Splits a left-to-right order at the anchors. Icons between the divider and the shelf icon
     /// count as hidden: that is where a ⌘-drag "onto the shelf" lands.
     public static func sections(_ order: [String]) -> (hidden: [String], visible: [String])? {
-        guard let i = order.firstIndex(of: IDs.icon), order.contains(IDs.divider) else { return nil }
+        guard Set(order).count == order.count,
+              let i = order.firstIndex(of: IDs.icon), let divider = order.firstIndex(of: IDs.divider), divider < i else { return nil }
         let left = order[..<i].filter { !IDs.isAnchor($0) }
         let right = order[(i + 1)...].filter { !IDs.isAnchor($0) }
         return (Array(left), Array(right))
@@ -131,6 +132,11 @@ public enum Planner {
 
 /// Compares the four places that must agree. Empty result = OK.
 public enum Check {
+    public static func livenessProblems(state: State?, now: Date = Date()) -> [String] {
+        guard let state else { return ["no state from the app"] }
+        let age = now.timeIntervalSince(state.updated)
+        return age > 30 ? ["app has not updated for \(Int(age)) s (hung?)"] : []
+    }
     public static func problems(reality: [String], state: State?, layout: Layout, now: Date = Date()) -> [String] {
         var out: [String] = []
         guard let s = Planner.sections(reality) else {
@@ -142,10 +148,9 @@ public enum Check {
             out.append("menu bar ≠ memory: \(wrong.joined(separator: ", ")) out of place")
         }
         guard let state else { return out + ["no state from the app"] }
+        if let reason = state.pauseReason { out.append("app is paused: \(reason)") }
         // The app rewrites its state at least every 10 s. Older than 30 s means it is hung (or gone).
-        if now.timeIntervalSince(state.updated) > 30 {
-            out.append("app has not updated for \(Int(now.timeIntervalSince(state.updated))) s (hung?)")
-        }
+        out += livenessProblems(state: state, now: now)
         if state.icons != reality { out.append("app's live list ≠ menu bar") }
         if let bar = state.bar, bar != s.hidden { out.append("shelf bar ≠ hidden icons") }
         if let settings = state.settings, settings.hidden != s.hidden || settings.visible != s.visible {

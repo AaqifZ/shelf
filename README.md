@@ -18,7 +18,7 @@ Apps add and remove their menu bar icons whenever they like. When an icon comes 
 
 ![shelf saves where you put each icon, checks the menu bar twice a second, and moves back any icon that has moved.](docs/img/3-how.png)
 
-shelf remembers where each icon belongs and moves it back when it drifts. It is small: about 2,000 lines of Swift, no dependencies.
+shelf remembers where each icon belongs and moves it back when it drifts. It is small: about 3,000 lines of Swift, no dependencies.
 
 ## Install
 
@@ -55,7 +55,7 @@ To remove shelf, run `scripts/uninstall.sh`. It removes the app, the command and
 | Command | Result |
 |---|---|
 | `shelf list` | Shows every icon, left to right, with its section. Add `--debug` for unmatched windows. |
-| `shelf check` | Compares the menu bar, the shelf bar, the settings window and the memory. Exit code 1 on a problem. |
+| `shelf check` | Compares the menu bar, the shelf bar, the settings window and the memory. Exit code 1 means a problem. Exit code 3 means Shelf is safely paused. |
 | `shelf settings` | Opens the settings window. |
 | `shelf place hidden\|visible <id>` | Moves an icon to a section. |
 | `shelf restart` | Restarts the app. |
@@ -85,19 +85,26 @@ Every design choice and its reason is in [docs/DECISIONS.md](docs/DECISIONS.md).
 
 ### Tests
 
-- `swift run ShelfSelfTest` tests the planner, the layout memory and the check. It does not touch the menu bar.
+- `scripts/verify-reliability.sh` builds every target and runs the four offline suites. It does not install Shelf or move icons.
+- `swift run ShelfSelfTest` tests the planner, layout memory and health check.
+- `swift run ShelfDisplayTest` tests display selection and ambiguous ownership.
+- `swift run ShelfRecoveryTest` tests retry limits, cooldowns and window recreation.
+- `swift run ShelfPersistenceTest` tests configuration failures, atomic saves and log rotation.
+- `node --test scripts/watch.test.mjs` tests the live movement brake.
 - `swift run ShelfChurn "$(which shelf)" 50` is the live test that docs/DECISIONS.md calls Test 1. A test icon appears and disappears 50 times. shelf must put it back in Visible each time, and `shelf check` must pass each time. It moves real icons, so do not run it while you work.
+
+After a new build starts, `node scripts/watch.mjs 180 15` watches for three minutes. It stops Shelf above 15 moves or when log continuity fails.
 
 ## Limits
 
 - This is a personal project. It has no support and no updater.
 - shelf is tested on macOS 26 only. It depends on how macOS 26 handles menu bar windows and events.
 - shelf uses private WindowServer calls and posts synthetic mouse events. A macOS update can break it.
-- shelf manages the menu bar on the main display only.
+- shelf selects the real menu bar strip on the display that contains its icon. Physical display transitions remain early and need more real-world testing.
 - While the shelf bar or the settings window is open, shelf captures icon pictures, so macOS shows its Screen Recording indicator.
 - macOS indicators, such as the microphone-in-use icon, cannot move. shelf leaves them alone.
 - Icons cannot go right of the Control Center icons (Wi-Fi, Battery and the others). shelf keeps app icons to their left.
-- In the first trial on one Mac, 2 of 47 hourly checks failed. One cause is fixed. Treat shelf as early software.
+- The reliability update passed 98 offline assertions and a bounded live gate with zero moves. Longer real-world soak testing remains open. Treat shelf as early software.
 
 Built with AI coding agents.
 

@@ -9,35 +9,42 @@ enum Store {
     static let logURL = dir.appendingPathComponent("shelf.log")
     static let checkLogURL = dir.appendingPathComponent("check.log")
 
-    private static let encoder: JSONEncoder = {
-        let e = JSONEncoder()
-        e.outputFormatting = [.prettyPrinted, .sortedKeys]
-        e.dateEncodingStrategy = .iso8601
-        return e
-    }()
-    private static let decoder: JSONDecoder = {
-        let d = JSONDecoder()
-        d.dateDecodingStrategy = .iso8601
-        return d
-    }()
+    static func loadConfig() -> ConfigurationFile.Load { ConfigurationFile.load(from: configURL) }
 
-    static func loadConfig() -> Config? {
-        guard let data = try? Data(contentsOf: configURL) else { return nil }
-        return try? decoder.decode(Config.self, from: data)
+    @discardableResult
+    static func save(_ config: Config) -> Bool {
+        switch ConfigurationFile.save(config, to: configURL) {
+        case .success:
+            return true
+        case .failure(let problem):
+            log("configuration was not saved: \(problem)")
+            return false
+        }
     }
 
-    static func save(_ config: Config) { write(config, to: configURL) }
-    static func save(_ state: State) { write(state, to: stateURL) }
+    @discardableResult
+    static func save(_ state: State) -> Bool { write(state, to: stateURL) }
 
     static func loadState() -> State? {
         guard let data = try? Data(contentsOf: stateURL) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
         return try? decoder.decode(State.self, from: data)
     }
 
-    private static func write<T: Encodable>(_ value: T, to url: URL) {
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        guard let data = try? encoder.encode(value) else { return }
-        try? data.write(to: url, options: .atomic)
+    private static func write<T: Encodable>(_ value: T, to url: URL) -> Bool {
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            encoder.dateEncodingStrategy = .iso8601
+            let data = try encoder.encode(value)
+            try data.write(to: url, options: .atomic)
+            return true
+        } catch {
+            log("could not write \(url.lastPathComponent): \(error.localizedDescription)")
+            return false
+        }
     }
 
     private static let logQueue = DispatchQueue(label: "shelf.log")
@@ -45,15 +52,9 @@ enum Store {
         let line = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
         // Synchronous: the CLI (`shelf check --log`) exits right after logging, and an async write would be lost.
         logQueue.sync {
-            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            // Keep the log small: start over past 1 MB.
-            if let size = try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int, size > 1_000_000 {
-                try? FileManager.default.removeItem(at: url)
-            }
-            if let h = try? FileHandle(forWritingTo: url) {
-                h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close()
-            } else {
-                try? Data(line.utf8).write(to: url)
+            if case .failure(let problem) = RotatingLogFile.append(line, to: url) {
+                let error = "shelf: could not write \(url.path): \(problem)\n"
+                try? FileHandle.standardError.write(contentsOf: Data(error.utf8))
             }
         }
     }

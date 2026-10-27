@@ -29,7 +29,7 @@ final class ShelfBar {
     func toggle() { isOpen ? close() : open() }
 
     func open() {
-        guard !isOpen else { return }
+        guard !isOpen, model.pauseReason == nil, ScreenGeometry.screen(for: model.icon(IDs.icon)) != nil else { return }
         isOpen = true
         model.barOpen = true
         model.barDrew(model.sections.hidden.map(\.id))
@@ -51,7 +51,7 @@ final class ShelfBar {
 
     /// Right-aligned under the shelf icon, just below the menu bar.
     func layout() {
-        guard let screen = NSScreen.screens.first else { return }
+        guard model.pauseReason == nil, let screen = ScreenGeometry.screen(for: model.icon(IDs.icon)) else { close(); return }
         let size = host.sizeThatFits(in: CGSize(width: screen.frame.width - 16, height: 200))
         let menuBarHeight = screen.frame.maxY - screen.visibleFrame.maxY
         var right = screen.frame.maxX - 8

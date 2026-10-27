@@ -17,13 +17,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Store.log("shelf started (pid \(getpid()))")
         seedPositions()
         guard permissionsReady() else { return }
+        // Import only after this app has its permissions. Keep Ice alive until its layout is saved.
+        if case .missing = Store.loadConfig(), !importFromIce() {
+            showStartupProblem("Cannot import Ice's layout. See ~/.shelf/shelf.log.")
+            return
+        }
+        let config: Config
+        switch Store.loadConfig() {
+        case .missing: config = Config()
+        case .loaded(let saved): config = saved
+        case .failed(let problem):
+            Store.log("startup paused: \(problem)")
+            showStartupProblem("Cannot read the saved layout. See ~/.shelf/shelf.log.")
+            return
+        }
         quitIce()
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] _ in
             self?.quitIce()
         }
         WindowServer.allowCursorHidingInBackground()
 
-        let config = Store.loadConfig() ?? Config()
         engine = Engine(config: config)
         model = Model(engine: engine, options: config.options)
         bar = ShelfBar(model: model)
@@ -135,9 +148,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         p.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
         p.arguments = ["check", "--log", "--quiet"]
         p.terminationHandler = { [weak self] proc in
-            let ok = proc.terminationStatus == 0
             let time = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short)
-            DispatchQueue.main.async { self?.model.lastCheck = ok ? "OK at \(time)" : "PROBLEM at \(time), see ~/.shelf/check.log" }
+            let result = proc.terminationStatus == 0 ? "OK" : (proc.terminationStatus == 3 ? "PAUSED" : "PROBLEM")
+            DispatchQueue.main.async { self?.model.lastCheck = "\(result) at \(time), see ~/.shelf/check.log" }
         }
         try? p.run()
     }
@@ -154,6 +167,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Until both are granted, shelf shows a ⚠︎ icon that says so, and Ice keeps running: the menu bar is
     /// never left unmanaged. macOS only applies a new grant after a restart, so shelf exits and launchd starts it again.
     private var waitingItem: NSStatusItem?
+
+    private func showStartupProblem(_ message: String) {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.autosaveName = "shelf.icon"
+        item.button?.image = NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: "Shelf is paused")
+        let menu = NSMenu()
+        menu.addItem(withTitle: message, action: nil, keyEquivalent: "")
+        menu.addItem(withTitle: "Open Shelf data folder", action: #selector(openDataFolder), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "Retry after repair", action: #selector(restart), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "Switch back to Ice", action: #selector(switchToIce), keyEquivalent: "").target = self
+        item.menu = menu; waitingItem = item
+    }
+
+    @objc private func openDataFolder() { NSWorkspace.shared.open(Store.dir) }
 
     /// A new status item lands at the far left, which on a notched Mac can be off the screen (or inside
     /// Ice's hidden section), and then you never see it. So on first run, ask for the right end, next to

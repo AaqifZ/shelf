@@ -49,6 +49,7 @@ private struct SettingsView: View {
             Toggle("… when I click empty menu bar space", isOn: binding(\.revealOnClick))
             Toggle("… when I scroll in the menu bar", isOn: binding(\.revealOnScroll))
             Text("Hotkey ⌥⌘,  ·  Last check: \(model.lastCheck)").font(.caption).foregroundStyle(.secondary)
+            if let reason = model.pauseReason { Text("Paused: \(reason)").font(.caption).foregroundStyle(.orange) }
         }
         .padding(20)
         // Wide enough for the widest row, so no icon is ever cut off. Computed from the icons
@@ -67,7 +68,7 @@ private struct SettingsView: View {
     }
 
     private func binding(_ key: WritableKeyPath<Options, Bool>) -> Binding<Bool> {
-        Binding(get: { model.options[keyPath: key] }, set: { var o = model.options; o[keyPath: key] = $0; model.setOptions(o) })
+        Binding(get: { model.options[keyPath: key] }, set: { model.setOption(key, to: $0) })
     }
 }
 

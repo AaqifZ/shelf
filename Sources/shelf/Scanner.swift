@@ -15,30 +15,95 @@ final class Scanner {
     private var suffixes: [CGWindowID: Int] = [:]
     var log: (String) -> Void = { _ in }
 
-    /// Current icons on the main display's menu bar, left to right.
+    private(set) var pauseReason: String? = "no observation yet"
+    private(set) var displayBounds: CGRect?
+    private var topology = ""
+    private var settledAfter = Date.distantPast
+    private var activeDisplayID: UInt32?
+    private let requireSettledTopology: Bool
+    private let importingIce: Bool
+
+    init(requireSettledTopology: Bool = false, importingIce: Bool = false) {
+        self.requireSettledTopology = requireSettledTopology
+        self.importingIce = importingIce
+    }
+
+    /// Current icons on the display that holds the real shelf icon, left to right.
     func scan() -> [Icon] {
+        displayBounds = nil
+        guard CGPreflightScreenCaptureAccess(), AXIsProcessTrusted() else {
+            pauseReason = "Accessibility or Screen Recording permission is unavailable"
+            return []
+        }
         let ids = WindowServer.menuBarWindowIDs()
         let info = WindowServer.info(ids)
         let mainMenuLevel = Int(CGWindowLevelForKey(.mainMenuWindow))
-        // Status items only (not the bar itself), on the main display, resting (not mid-drag).
-        let windows = ids.compactMap { id -> (CGWindowID, WindowServer.Info)? in
-            guard let i = info[id], i.level != mainMenuLevel, i.frame.width > 0, abs(i.frame.minY) < 1,
-                  !Self.systemIndicators.contains(i.name ?? "") else { return nil }
+        var count: UInt32 = 0
+        guard CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 else {
+            pauseReason = "display list is unavailable"; return []
+        }
+        var displayIDs = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        guard CGGetActiveDisplayList(count, &displayIDs, &count) == .success else {
+            pauseReason = "display list changed during scan"; return []
+        }
+        let displays = displayIDs.prefix(Int(count)).map { DisplaySelection.Display(id: $0, frame: CGDisplayBounds($0)) }
+        let signature = displays.sorted { $0.id < $1.id }.map { "\($0.id):\($0.frame)" }.joined(separator: "|")
+        if signature != topology {
+            topology = signature
+            owners.removeAll(); misses.removeAll()
+            settledAfter = Date().addingTimeInterval(1)
+        }
+        let resting = ids.compactMap { id -> (CGWindowID, WindowServer.Info)? in
+            guard let i = info[id], i.level != mainMenuLevel, i.frame.width > 0 else { return nil }
             return (id, i)
         }
+        let selection: DisplaySelection.Selection
+        switch DisplaySelection.select(windows: resting.map { .init(id: $0.0, name: $0.1.name, frame: $0.1.frame) }, displays: displays,
+                                       anchorName: importingIce ? "Ice.ControlItem.Visible" : "shelf.icon",
+                                       dividerName: importingIce ? "Ice.ControlItem.Hidden" : "shelf.divider") {
+        case .success(let selected): selection = selected
+        case .failure(let problem):
+            pauseReason = problem.rawValue
+            return []
+        }
+        displayBounds = selection.display.frame
+        if activeDisplayID != selection.display.id {
+            activeDisplayID = selection.display.id
+            owners.removeAll(); misses.removeAll()
+            settledAfter = Date().addingTimeInterval(1)
+        }
+        pauseReason = requireSettledTopology && Date() < settledAfter ? "display topology is settling" : nil
+        let windows = resting.filter { selection.windows.contains($0.0) && !Self.systemIndicators.contains($0.1.name ?? "") }
         let live = Set(windows.map(\.0))
-        owners = owners.filter { live.contains($0.key) && info[$0.key]?.name == $0.value.name }
+        let runningApps = NSWorkspace.shared.runningApplications.filter { !$0.isTerminated }
+        let runningPIDs = Set(runningApps.map(\.processIdentifier))
+        let controlCenterPID = runningApps.first { $0.bundleIdentifier == IDs.controlCenterBundle }?.processIdentifier
+        let windowNames = windows.map { $0.1.name }
+        func isKnownControlCenter(_ i: WindowServer.Info) -> Bool {
+            controlCenterPID != nil && IDs.canUseControlCenterFallback(i.name, among: windowNames)
+        }
+        owners = owners.filter { live.contains($0.key) && info[$0.key]?.name == $0.value.name && runningPIDs.contains($0.value.owner.pid) }
         misses = misses.filter { live.contains($0.key) }
 
         let now = Date()
-        let unknown = windows.filter { owners[$0.0] == nil && !Self.isShelf($0.1) && (misses[$0.0]?.next ?? .distantPast) <= now }
+        let unknown = windows.filter {
+            owners[$0.0] == nil && !Self.isShelf($0.1) && (misses[$0.0]?.next ?? .distantPast) <= now
+        }
         if !unknown.isEmpty { resolve(unknown) }
+        if windows.contains(where: {
+            !Self.isShelf($0.1) && !isKnownControlCenter($0.1) && owners[$0.0] == nil
+        }) {
+            pauseReason = "menu bar ownership is incomplete"
+        }
 
         var icons: [Icon] = []
         for (id, i) in windows.sorted(by: { $0.1.frame.minX < $1.1.frame.minX }) {
             let owner: Owner
             if Self.isShelf(i) { owner = Owner(pid: Self.shelfPID, bundle: IDs.bundle, label: i.name ?? "") }
             else if let o = owners[id] { owner = o.owner }
+            else if isKnownControlCenter(i), let pid = controlCenterPID {
+                owner = Owner(pid: pid, bundle: IDs.controlCenterBundle, label: i.name ?? "")
+            }
             else { continue }  // not matched yet; it joins the list once Accessibility knows it
             let name = i.name ?? owner.label
             icons.append(Icon(id: "\(owner.bundle)/\(name)", windowID: id, pid: owner.pid, bundle: owner.bundle, name: name,
@@ -74,11 +139,10 @@ final class Scanner {
         let apps = Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
         lastUnmatched = []
         for (id, i) in windows {
-            let c = CGPoint(x: i.frame.midX, y: i.frame.midY)
-            let match = items
-                .filter { abs($0.frame.midX - c.x) <= 3 }
-                .min { abs($0.frame.midX - c.x) < abs($1.frame.midX - c.x) }
-            if let match, IDs.ownerFits(windowName: i.name, owner: match.owner.bundle, apps: apps) {
+            let eligible = items.filter { IDs.ownerFits(windowName: i.name, owner: $0.owner.bundle, apps: apps) }
+            let index = DisplaySelection.uniqueMatch(frame: i.frame, candidates: eligible.map(\.frame))
+            if let index {
+                let match = eligible[index]
                 owners[id] = (match.owner, i.name)
             } else {
                 lastUnmatched.append((id, i))

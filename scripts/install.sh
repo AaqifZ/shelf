@@ -10,8 +10,11 @@ PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
 
 swift build -c release --product shelf
-mkdir -p "$APP/Contents/MacOS" "$HOME/.local/bin" "$HOME/Library/LaunchAgents" "$HOME/.shelf"
+# The certificate of the installed app, read before the copy replaces it (empty if none or ad hoc).
+CURRENT=$(codesign -dvv "$APP" 2>&1 | sed -n 's/^Authority=//p' | head -1)
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$HOME/.local/bin" "$HOME/Library/LaunchAgents" "$HOME/.shelf"
 cp .build/release/shelf "$APP/Contents/MacOS/shelf"
+cp packaging/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 cat > "$APP/Contents/Info.plist" <<PL
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -19,6 +22,7 @@ cat > "$APP/Contents/Info.plist" <<PL
   <key>CFBundleIdentifier</key><string>$LABEL</string>
   <key>CFBundleName</key><string>shelf</string>
   <key>CFBundleExecutable</key><string>shelf</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>LSUIElement</key><true/>
@@ -28,6 +32,11 @@ PL
 # A fixed certificate keeps the Accessibility and Screen Recording grants across rebuilds.
 # Create it once with scripts/make-signing-cert.sh. Set SHELF_SIGN_IDENTITY to use another certificate.
 IDENTITY="${SHELF_SIGN_IDENTITY:-shelf-local}"
+# Without that certificate, keep the installed app's certificate: a new one drops the grants.
+if ! security find-identity -p codesigning | grep -q "$IDENTITY" && [ -n "$CURRENT" ]; then
+  echo "note: no $IDENTITY certificate, so shelf keeps its current certificate ($CURRENT)."
+  IDENTITY="$CURRENT"
+fi
 if security find-identity -p codesigning | grep -q "$IDENTITY"; then
   codesign --force --sign "$IDENTITY" --identifier "$LABEL" "$APP"
 else

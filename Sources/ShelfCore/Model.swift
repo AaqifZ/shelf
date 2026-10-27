@@ -51,6 +51,7 @@ public struct Layout: Codable, Equatable, Sendable {
 
 public enum IDs {
     public static let bundle = "com.aaqifz.shelf"
+    public static let controlCenterBundle = "com.apple.controlcenter"
     /// The divider: a status item 10,000 points long. Everything left of it is pushed off the screen.
     public static let divider = "\(bundle)/shelf.divider"
     /// The shelf icon: always visible, just right of the divider.
@@ -61,6 +62,18 @@ public enum IDs {
     /// Control Center's own icons (Wi-Fi, Battery, ...). macOS keeps them as one block at the right:
     /// another app's icon cannot be dropped among or right of them (verified on macOS 26).
     public static func isSystemBlock(_ id: String) -> Bool { id.hasPrefix("com.apple.controlcenter/") }
+
+    /// WindowServer exposes these immovable macOS items by stable names, but Accessibility does not
+    /// always expose matching extras. Scanner also requires the name to be unique before fallback.
+    public static func isKnownControlCenterWindow(_ name: String?) -> Bool {
+        guard let name else { return false }
+        return name == "Clock" || name.hasPrefix("BentoBox")
+    }
+
+    public static func canUseControlCenterFallback(_ name: String?, among names: [String?]) -> Bool {
+        guard isKnownControlCenterWindow(name), let name else { return false }
+        return names.lazy.filter { $0 == name }.count == 1
+    }
 
     /// macOS does not let these move. They stay where they are and are never hidden.
     public static func isFixed(_ id: String) -> Bool {
@@ -75,6 +88,36 @@ public enum IDs {
     }
 }
 
+/// macOS 26 draws the menu bar on every display, each with its own status item windows. The real
+/// windows sit on one display at a time and follow the user; the other displays get copies, named
+/// after the app, its pid, or nothing. On 25 Oct a display left of the main one put both sets at y 0:
+/// shelf saw every icon twice and made 121 drags in 5 minutes that could never land.
+/// The real windows are one unbroken strip that holds shelf's own icon (a copy is never named "shelf.icon").
+public enum Strip {
+    public struct Window: Equatable, Sendable {
+        public var id: UInt32
+        public var minX: Double
+        public var maxX: Double
+        public init(id: UInt32, minX: Double, maxX: Double) { self.id = id; self.minX = minX; self.maxX = maxX }
+    }
+
+    /// The windows edge to edge with `anchor`, when the anchor is on the main display (`mainMinX...mainMaxX`).
+    /// None otherwise: shelf manages the main display only, so it waits until the icons come back.
+    public static func real(_ windows: [Window], anchor: UInt32?, mainMinX: Double, mainMaxX: Double) -> Set<UInt32> {
+        guard let start = windows.first(where: { $0.id == anchor }),
+              start.minX >= mainMinX - 1, start.maxX <= mainMaxX + 1 else { return [] }
+        var strip: Set<UInt32> = [start.id]
+        func touching(_ edge: Double, _ side: KeyPath<Window, Double>) -> Window? {
+            windows.filter { !strip.contains($0.id) && abs($0[keyPath: side] - edge) <= 1 }
+                .min { abs($0[keyPath: side] - edge) < abs($1[keyPath: side] - edge) }
+        }
+        var left = start, right = start
+        while let w = touching(left.minX, \.maxX) { strip.insert(w.id); left = w }
+        while let w = touching(right.maxX, \.minX) { strip.insert(w.id); right = w }
+        return strip
+    }
+}
+
 /// What the running app writes after every change, so `shelf check` can compare it with reality.
 public struct State: Codable, Equatable, Sendable {
     public var updated: Date
@@ -86,9 +129,11 @@ public struct State: Codable, Equatable, Sendable {
     public var settings: Layout?
     /// Icons shown in the menu bar for a moment after a click from the shelf bar.
     public var pinned: [String]
+    public var pauseReason: String?
 
-    public init(updated: Date, icons: [String], bar: [String]?, settings: Layout?, pinned: [String]) {
+    public init(updated: Date, icons: [String], bar: [String]?, settings: Layout?, pinned: [String], pauseReason: String? = nil) {
         self.updated = updated; self.icons = icons; self.bar = bar; self.settings = settings; self.pinned = pinned
+        self.pauseReason = pauseReason
     }
 }
 
@@ -98,11 +143,33 @@ public struct Options: Codable, Equatable, Sendable {
     public var revealOnClick = true
     public var revealOnScroll = true
     public init() {}
+    private enum CodingKeys: String, CodingKey { case revealOnHover, revealOnClick, revealOnScroll }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        revealOnHover = try values.decodeIfPresent(Bool.self, forKey: .revealOnHover) ?? true
+        revealOnClick = try values.decodeIfPresent(Bool.self, forKey: .revealOnClick) ?? true
+        revealOnScroll = try values.decodeIfPresent(Bool.self, forKey: .revealOnScroll) ?? true
+    }
 }
 
 /// Everything in ~/.shelf/config.json.
 public struct Config: Codable, Equatable, Sendable {
+    public var schemaVersion = 1
     public var layout = Layout()
     public var options = Options()
     public init() {}
+    private enum CodingKeys: String, CodingKey { case schemaVersion, layout, options }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try values.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
+        guard schemaVersion == 1 else {
+            throw DecodingError.dataCorruptedError(forKey: .schemaVersion, in: values, debugDescription: "unsupported configuration version")
+        }
+        layout = try values.decode(Layout.self, forKey: .layout)
+        options = try values.decodeIfPresent(Options.self, forKey: .options) ?? Options()
+        let ids = layout.hidden + layout.visible
+        guard Set(ids).count == ids.count, !ids.contains(where: { $0.isEmpty || IDs.isAnchor($0) }) else {
+            throw DecodingError.dataCorruptedError(forKey: .layout, in: values, debugDescription: "layout contains duplicate, empty or reserved identities")
+        }
+    }
 }

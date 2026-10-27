@@ -4,10 +4,12 @@ import ShelfCore
 /// The loop: scan the menu bar, compare it with the layout memory, fix drift. Twice a second (a scan costs about 1 ms).
 /// Everything here runs on one serial queue, so there is never more than one move in flight.
 final class Engine {
-    struct Snapshot { var icons: [Icon]; var layout: Layout; var pinned: Set<String> }
+    struct Snapshot { var icons: [Icon]; var layout: Layout; var pinned: Set<String>; var pauseReason: String?; var options: Options }
 
     let queue = DispatchQueue(label: "shelf.engine", qos: .userInitiated)
-    private let scanner = Scanner()
+    private let scanner = Scanner(requireSettledTopology: true)
+    private var storageProblem: String?
+    private var clickGeneration = 0
     private var config: Config
     private var icons: [Icon] = []
     private var timer: DispatchSourceTimer?
@@ -18,16 +20,8 @@ final class Engine {
     /// The user is ⌘-dragging in the menu bar. When they let go, reality becomes the layout.
     private var arranging = false
     private var arrangedAt: Date?
-    /// Per appearance (icon id + window): failed moves in a row, and successful moves that did not stay.
-    private var failures: [String: Int] = [:]
-    private var successes: [String: [Date]] = [:]
-    /// Per appearance: moves in a row that landed a slot off. An icon that never lands is a loop, not progress.
-    private var slotOffs: [String: Int] = [:]
-    /// What the world looked like at the last successful move. A layout change or a click is a reason
-    /// to move again, not a fight.
-    private var successContext: [String: String] = [:]
-    /// Icons to skip until a time: a short back-off after a failed move, a long one after a fight.
-    private var benched: [String: Date] = [:]
+    /// Retry, loop and fight state, keyed by one concrete status item appearance.
+    private var recovery = RecoveryPolicy()
 
     /// Called on the main queue after every scan.
     var onUpdate: (Snapshot) -> Void = { _ in }
@@ -53,20 +47,20 @@ final class Engine {
     /// engine's current layout, so two quick edits never overwrite each other (Codex follow-up F2).
     func place(_ id: String, in section: Section, before: String?) {
         queue.async { [self] in
-            config.layout = Planner.place(id, in: section, before: before, layout: config.layout)
-            Store.save(config)
+            var next = config
+            next.layout = Planner.place(id, in: section, before: before, layout: config.layout)
+            guard save(next) else { publish(); return }
             Store.log("placed \(id) in \(section.rawValue)\(before.map { " before \($0)" } ?? "")")
             tick()
         }
     }
 
-    func setOptions(_ options: Options) {
-        queue.async { [self] in config.options = options; Store.save(config) }
+    func setOption(_ key: WritableKeyPath<Options, Bool>, to value: Bool) {
+        queue.async { [self] in var next = config; next.options[keyPath: key] = value; _ = save(next); publish() }
     }
 
     func setArranging(_ on: Bool) {
-        // Signals during or just after shelf's own moves are echoes of them, not the user.
-        if Date().timeIntervalSince(Mover.lastPost) < 0.5 { return }
+        // Reveal rejects Shelf's tagged synthetic events before it sends a gesture here.
         queue.async { [self] in
             // Learn only from a whole gesture: a ⌘-mouse-down in the menu bar, then its mouse-up.
             // A stray mouse-up on its own (a late echo of a click) teaches nothing.
@@ -78,17 +72,59 @@ final class Engine {
     /// Shows a hidden icon in the menu bar and clicks it. It goes back once its menu closes.
     func clickThrough(_ id: String, right: Bool = false) {
         queue.async { [self] in
-            pins[id] = Date()
-            icons = scanner.scan()
-            reconcile(allowWhileMenuOpen: true)
-            icons = scanner.scan()
-            guard let icon = icons.first(where: { $0.id == id }) else { Store.log("click: \(id) not found"); return }
-            guard icon.x >= 0 else { Store.log("click: \(id) did not come on screen (x \(Int(icon.x)))"); return }
-            usleep(50_000)
-            Mover.click(icon, right: right)
-            Store.log("click: \(id) at x \(Int(icon.x))")
-            publish()
+            clickGeneration += 1
+            waitForClick(id, right: right, generation: clickGeneration, deadline: Date().addingTimeInterval(2))
         }
+    }
+
+    private func waitForClick(_ id: String, right: Bool, generation: Int, deadline: Date) {
+        guard generation == clickGeneration else { return }
+        guard Date() < deadline else { Store.log("click: \(id) expired while input remained busy"); return }
+        let busy = CGEventSource.buttonState(.combinedSessionState, button: .left) ||
+            CGEventSource.buttonState(.combinedSessionState, button: .right) ||
+            CGEventSource.buttonState(.combinedSessionState, button: .center) ||
+            CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .mouseMoved) < 0.15
+        if busy {
+            queue.asyncAfter(deadline: .now() + 0.05) { [self] in
+                waitForClick(id, right: right, generation: generation, deadline: deadline)
+            }
+            return
+        }
+        performClick(id, right: right)
+    }
+
+    private func performClick(_ id: String, right: Bool) {
+        guard !arranging && arrangedAt == nil else {
+            Store.log("click: \(id) ignored while the user is arranging the menu bar")
+            return
+        }
+        pins[id] = Date()
+        icons = scanner.scan()
+        guard scanner.pauseReason == nil, storageProblem == nil else {
+            pins[id] = nil; publish(); return
+        }
+        if let icon = icons.first(where: { $0.id == id }) {
+            recovery.reset(Appearance(id: id, windowID: icon.windowID))
+        }
+        reconcile(allowWhileMenuOpen: true)
+        icons = scanner.scan()
+        guard let icon = icons.first(where: { $0.id == id }) else {
+            pins[id] = nil
+            Store.log("click: \(id) not found")
+            publish()
+            return
+        }
+        guard scanner.pauseReason == nil, let bounds = scanner.displayBounds,
+              bounds.contains(CGRect(x: icon.x, y: icon.y, width: icon.width, height: icon.height)) else {
+            pins[id] = nil
+            Store.log("click: \(id) did not come on screen (x \(Int(icon.x)))")
+            publish()
+            return
+        }
+        usleep(50_000)
+        if Mover.click(icon, right: right) { Store.log("click: \(id) at x \(Int(icon.x))") }
+        else { pins[id] = nil; Store.log("click: \(id) cancelled: target or input changed") }
+        publish()
     }
 
     func refreshNow() { queue.async { [self] in tick() } }
@@ -97,13 +133,15 @@ final class Engine {
 
     private func tick() {
         icons = scanner.scan()
+        guard scanner.pauseReason == nil else { publish(); return }
         let ids = icons.map(\.id)
         let layout = config.layout
 
         // First run with no memory: whatever is in the menu bar now is the layout.
         if layout.hidden.isEmpty && layout.visible.isEmpty, Planner.sections(ids) != nil {
-            config.layout = Planner.adopt(actual: ids, into: layout)
-            Store.save(config)
+            var next = config
+            next.layout = Planner.adopt(actual: ids, into: layout)
+            guard save(next) else { publish(); return }
             Store.log("first run: adopted the current menu bar as the layout")
         }
 
@@ -114,8 +152,8 @@ final class Engine {
             arrangedAt = nil
             let new = Planner.adopt(actual: ids, into: config.layout, pinned: Set(pins.keys))
             if new != config.layout {
-                config.layout = new
-                Store.save(config)
+                var next = config; next.layout = new
+                guard save(next) else { publish(); return }
                 Store.log("learned a ⌘-drag: hidden \(new.hidden.count), visible \(new.visible.count)")
             }
         }
@@ -134,6 +172,9 @@ final class Engine {
             // Keep it while its menu is open (and at least 1.5 s); never longer than 5 minutes.
             if (age > 1.5 && !menuOpen) || age > 300 {
                 pins[id] = nil
+                if let icon = icons.first(where: { $0.id == id }) {
+                    recovery.reset(Appearance(id: id, windowID: icon.windowID))
+                }
                 Store.log("unpinned \(id)")
             }
         }
@@ -142,11 +183,17 @@ final class Engine {
     /// Closed loop: plan, do one move, look again. At most 8 moves per tick.
     private func reconcile(allowWhileMenuOpen: Bool) {
         for _ in 0..<8 {
+            guard scanner.pauseReason == nil, storageProblem == nil else { return }
             let ids = icons.map(\.id)
             guard let target = Planner.target(actual: ids, layout: config.layout, pinned: Set(pins.keys)) else { return }
             let now = Date()
-            benched = benched.filter { $0.value > now }
-            guard let move = Planner.moves(actual: ids, target: target).first(where: { benched[$0.id] == nil }) else { return }
+            let appearances = Set(icons.map { Appearance(id: $0.id, windowID: $0.windowID) })
+            let context = "\(config.layout.hidden)|\(config.layout.visible)"
+            recovery.synchronize(active: appearances, context: context, now: now)
+            guard let move = Planner.moves(actual: ids, target: target).first(where: { move in
+                guard let icon = icons.first(where: { $0.id == move.id }) else { return false }
+                return !recovery.isBenched(Appearance(id: icon.id, windowID: icon.windowID), now: now)
+            }) else { return }
 
             // Never fight the person: no moves while a mouse button is down or the mouse just moved,
             // and none while a menu is open (except the move that shows a clicked icon).
@@ -166,19 +213,18 @@ final class Engine {
             // Landing a slot off is progress: re-plan at once. Only a stuck icon backs off.
             // A slot-off landing is progress: it clears the failure streak (Codex audit finding 5).
             // But three slot-off landings in a row is a loop (2026-10-06: 413 drags in 4 minutes), so back off.
-            let key = "\(move.id)#\(icon.windowID)"
+            let appearance = Appearance(id: move.id, windowID: icon.windowID)
             if outcome == .elsewhere {
-                failures[key] = nil
-                let n = (slotOffs[key] ?? 0) + 1
-                slotOffs[key] = n
-                if n >= 3 {
-                    let wait = min(60, pow(2, Double(n - 3)))  // 1, 2, 4 ... 60 s
-                    benched[move.id] = now.addingTimeInterval(wait)
-                    Store.log("\(move.id) landed a slot off \(n) times in a row; trying again in \(Int(wait)) s")
+                if case let .slotOff(count, retryAfter) = recovery.recordSlotOff(appearance, now: now),
+                   let retryAfter {
+                    Store.log("\(move.id) landed a slot off \(count) times in a row; trying again in \(retryAfter) s")
                 }
-            } else {
-                if outcome == .placed { slotOffs[key] = nil }
-                note(move.id, icon.windowID, ok: outcome == .placed, now: now)
+            } else if outcome == .placed {
+                if case let .fight(seconds)? = recovery.recordPlaced(appearance, now: now) {
+                    Store.log("\(move.id) keeps going back after moves; leaving this appearance alone for \(seconds / 60) minutes")
+                }
+            } else if case let .retryAfter(attempt, seconds) = recovery.recordStuck(appearance, now: now) {
+                Store.log("\(move.id) did not move (\(attempt) in a row); trying again in \(seconds) s")
             }
 
             // Wait until the window list shows the change, so the next plan sees the real order.
@@ -192,34 +238,15 @@ final class Engine {
         }
     }
 
-    /// A failed move is retried after 1, 2, 4, ... up to 60 seconds, forever: it is usually transient.
-    /// A move that works but does not stay (the app puts its icon back) three times in two minutes is a
-    /// fight, and shelf leaves that icon alone for 10 minutes. Counted per appearance: an icon that comes
-    /// back 40 times a day needs 40 moves, and that is the job.
-    private func note(_ id: String, _ window: CGWindowID, ok: Bool, now: Date) {
-        let key = "\(id)#\(window)"
-        if ok {
-            failures[key] = nil
-            let context = "\(config.layout.hidden)|\(config.layout.visible)|\(pins.keys.sorted())"
-            if successContext[key] != context { successes[key] = []; successContext[key] = context }
-            let recent = (successes[key] ?? []).filter { now.timeIntervalSince($0) < 120 } + [now]
-            successes[key] = recent
-            if recent.count >= 3 {
-                benched[id] = now.addingTimeInterval(600)
-                successes[key] = []
-                Store.log("\(id) keeps going back after moves; leaving it alone for 10 minutes")
-            }
-        } else {
-            let n = (failures[key] ?? 0) + 1
-            failures[key] = n
-            let wait = min(60, pow(2, Double(n - 1)))  // 1, 2, 4 ... 60 s
-            benched[id] = now.addingTimeInterval(wait)
-            Store.log("\(id) did not move (\(n) in a row); trying again in \(Int(wait)) s")
-        }
+    private func publish() {
+        let snap = Snapshot(icons: icons, layout: config.layout, pinned: Set(pins.keys), pauseReason: storageProblem ?? scanner.pauseReason, options: config.options)
+        DispatchQueue.main.async { self.onUpdate(snap) }
     }
 
-    private func publish() {
-        let snap = Snapshot(icons: icons, layout: config.layout, pinned: Set(pins.keys))
-        DispatchQueue.main.async { self.onUpdate(snap) }
+    private func save(_ next: Config) -> Bool {
+        guard Store.save(next) else { storageProblem = "layout could not be saved; see shelf.log"; return false }
+        config = next
+        storageProblem = nil
+        return true
     }
 }
